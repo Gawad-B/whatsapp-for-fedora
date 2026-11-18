@@ -90,9 +90,47 @@
     Shim.requestPermission = (...a) => RealNotification.requestPermission(...a);
     window.Notification = Shim;
 
+    /* local: WhatsApp's short tones are played through Web Audio, not the
+       <audio> element. Every media element that plays makes WebKit register an
+       MPRIS player and it never takes it down again, so GNOME kept showing an
+       empty, "Stopped" WhatsApp player after each tone. Web Audio registers
+       none. Voice notes are blob: URLs and still go through the element, where
+       a player with controls is what you want. If Web Audio fails for any
+       reason the element plays the tone as before, so sound is never lost. */
+    const TONE_URL = /^https:\/\/[^/]*\.whatsapp\.net\/.*\.mp3(?:[?#]|$)/;
+    const tones = new Map();   // url -> Promise<AudioBuffer>
+    let toneCtx = null;
+    const playTone = async (el, url) => {
+      toneCtx = toneCtx || new AudioContext();
+      if (toneCtx.state !== 'running') await toneCtx.resume();
+      if (toneCtx.state !== 'running') throw new Error('audio context is ' + toneCtx.state);
+      if (!tones.has(url))
+        tones.set(url, fetch(url)
+          .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+          .then(bytes => toneCtx.decodeAudioData(bytes)));
+      let buffer;
+      try { buffer = await tones.get(url); } catch (err) { tones.delete(url); throw err; }
+      const gain = toneCtx.createGain();
+      gain.gain.value = el.muted ? 0 : el.volume;
+      gain.connect(toneCtx.destination);
+      const source = toneCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(gain);
+      source.onended = () => { gain.disconnect(); el.dispatchEvent(new Event('ended')); };
+      source.start();
+      el.dispatchEvent(new Event('play'));
+      el.dispatchEvent(new Event('playing'));
+    };
+
     const realPlay = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function (...args) {
-      log('page sound: ' + String(this.currentSrc || this.src).slice(-28));
+      const url = String(this.currentSrc || this.src);
+      log('page sound: ' + url.slice(-28));
+      if (TONE_URL.test(url) && typeof AudioContext === 'function')
+        return playTone(this, url).catch(err => {
+          log('tone through Web Audio failed (' + err.message + '), using the element');
+          return realPlay.apply(this, args);
+        });
       return realPlay.apply(this, args);
     };
   } catch (err) {

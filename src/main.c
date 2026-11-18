@@ -31,7 +31,7 @@
 #define WA_ICON_NAME  "io.github.shehawey.whatsapp"
 #define WA_TRAY_ICON  "io.github.shehawey.whatsapp-tray"
 #define WA_TITLE      "WhatsApp"
-#define WA_VERSION    "1.0.11"
+#define WA_VERSION    "1.0.11-local"
 #define WA_URL        "https://web.whatsapp.com/"
 
 /* Presenting as desktop Chrome is what gets the full web client. Setting this
@@ -56,7 +56,7 @@
  * This was once blamed for the blank emoji as well, and it was not the cause.
  * The sheets were never cached at all -- see the emoji block in inject.js, which
  * is where that is now fixed. */
-#define WA_MEMORY_LIMIT_MB     2560
+#define WA_MEMORY_LIMIT_MB     1792   /* local: 2560 upstream; this laptop has 7.4 GB */
 #define WA_CONSERVATIVE_FRAC   0.55
 #define WA_STRICT_FRAC         0.85
 #define WA_POLL_INTERVAL_SECS  10.0
@@ -162,6 +162,10 @@ typedef struct WaAppTag {
     gint64          last_arrival_at;
     gint64          loaded_at;
     gboolean        start_hidden;
+    /* A failed page load is tried again on a growing delay; see on_load_failed. */
+    guint           retry_source;
+    guint           retry_count;
+    gboolean        load_failed;
 } WaApp;
 
 /* ------------------------------------------------------------------ config */
@@ -694,6 +698,50 @@ on_window_state_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
     push_focus_state(self);
 }
 
+/* --------------------------------------------------------------- reloading */
+
+/* local: a load that fails right after boot -- the network not up yet, or a
+ * clock still weeks behind, so the certificate is not valid yet -- used to leave
+ * WebKit's error page up until the app was reopened. A failed load is now tried
+ * again on a growing delay until one goes through. A certificate error is only
+ * ever retried, never accepted. */
+static const guint wa_retry_delays_s[] = { 5, 10, 20, 40, 60 };
+
+static gboolean
+on_retry_due(gpointer user_data)
+{
+    WaApp *self = user_data;
+
+    self->retry_source = 0;
+    webkit_web_view_load_uri(self->view, WA_URL);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean
+on_load_failed(WebKitWebView *view, WebKitLoadEvent event, const char *uri,
+               GError *error, gpointer user_data)
+{
+    WaApp *self = user_data;
+
+    /* A load cut short by the next one, or a link handed to the browser, is not
+     * a failure. */
+    if (g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED) ||
+        g_error_matches(error, WEBKIT_POLICY_ERROR,
+                        WEBKIT_POLICY_ERROR_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE))
+        return FALSE;
+
+    self->load_failed = TRUE;
+    if (!self->retry_source) {
+        const guint last = G_N_ELEMENTS(wa_retry_delays_s) - 1;
+        const guint delay = wa_retry_delays_s[MIN(self->retry_count, last)];
+        self->retry_count++;
+        g_message("load failed (%s): %s -- retrying in %u s", uri, error->message, delay);
+        self->retry_source = g_timeout_add_seconds(delay, on_retry_due, self);
+    }
+    /* WebKit's own error page stays up meanwhile and says what went wrong. */
+    return FALSE;
+}
+
 /* inject.js starts every page load with no idea where the focus is, so the state
  * is pushed again as soon as there is a page to receive it. */
 static void
@@ -701,7 +749,17 @@ on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer user_data)
 {
     WaApp *self = user_data;
 
+    /* WebKit shows its error page as a load of its own. One that starts while a
+     * retry is still pending is that page, not the client coming back. */
+    if (event == WEBKIT_LOAD_STARTED && !self->retry_source)
+        self->load_failed = FALSE;
+
     if (event == WEBKIT_LOAD_FINISHED) {
+        if (!self->load_failed && !self->retry_source && self->retry_count) {
+            g_message("loaded after %u retr%s", self->retry_count,
+                      self->retry_count == 1 ? "y" : "ies");
+            self->retry_count = 0;
+        }
         self->loaded_at = g_get_monotonic_time();
         push_focus_state(self);
     }
@@ -1853,6 +1911,14 @@ build_window(WaApp *self)
     char *cache_dir = g_build_filename(g_get_user_cache_dir(), "whatsapp", NULL);
     WebKitNetworkSession *session = webkit_network_session_new(data_dir, cache_dir);
     g_signal_connect(session, "download-started", G_CALLBACK(on_download_started), self);
+    /* local: WebKit keeps cookies in memory unless it is given a file, so every
+     * restart came up without the cookies web.whatsapp.com had set -- unlike a
+     * browser, which keeps them across restarts. */
+    char *cookie_file = g_build_filename(data_dir, "cookies.sqlite", NULL);
+    webkit_cookie_manager_set_persistent_storage(webkit_network_session_get_cookie_manager(session),
+                                                 cookie_file,
+                                                 WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+    g_free(cookie_file);
     g_free(data_dir);
     g_free(cache_dir);
 
@@ -1861,7 +1927,7 @@ build_window(WaApp *self)
     /* Without this the quirk for whatsapp.com overrides the line above and the
      * page sees Safari on macOS. */
     webkit_settings_set_enable_site_specific_quirks(settings, FALSE);
-    webkit_settings_set_enable_developer_extras(settings, TRUE);
+    webkit_settings_set_enable_developer_extras(settings, FALSE);
     webkit_settings_set_javascript_can_access_clipboard(settings, TRUE);
     /* A single-page app never navigates back, so the page cache is pure
      * overhead; WebGL is not used by WhatsApp Web at all. */
@@ -1943,20 +2009,27 @@ build_window(WaApp *self)
         g_free(hidpi);
     }
 
+    /* local: without this an AudioContext comes up "interrupted" and the tones
+     * inject.js plays through Web Audio are silent. */
+    WebKitWebsitePolicies *policies = webkit_website_policies_new_with_policies(
+        "autoplay", WEBKIT_AUTOPLAY_ALLOW, NULL);
     self->view = g_object_new(WEBKIT_TYPE_WEB_VIEW,
                               "network-session",      session,
                               "settings",             settings,
                               "user-content-manager", content,
+                              "website-policies",     policies,
                               NULL);
+    g_object_unref(policies);
     g_object_unref(settings);
     g_object_unref(content);
     g_object_unref(session);
 
     webkit_web_view_set_settings(self->view, settings);
 
-    /* Caches a moderate amount instead of the browser-sized default. */
+    /* Smallest cache model: WhatsApp keeps its own data in IndexedDB and the
+     * service worker, so WebKit's memory cache mostly duplicates it. */
     webkit_web_context_set_cache_model(webkit_web_view_get_context(self->view),
-                                       WEBKIT_CACHE_MODEL_DOCUMENT_BROWSER);
+                                       WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
 
     g_message("user agent: %s",
               webkit_settings_get_user_agent(webkit_web_view_get_settings(self->view)));
@@ -1976,6 +2049,7 @@ build_window(WaApp *self)
     g_signal_connect(self->view, "create", G_CALLBACK(on_create_web_view), self);
     g_signal_connect(self->view, "decide-policy", G_CALLBACK(on_decide_policy), self);
     g_signal_connect(self->view, "load-changed", G_CALLBACK(on_load_changed), self);
+    g_signal_connect(self->view, "load-failed", G_CALLBACK(on_load_failed), self);
     webkit_web_view_set_zoom_level(self->view, zoom);
 
     self->window = GTK_WINDOW(gtk_application_window_new(self->app));
