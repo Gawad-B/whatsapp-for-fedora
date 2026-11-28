@@ -123,6 +123,38 @@
     };
 
     const realPlay = HTMLMediaElement.prototype.play;
+
+    /* local: voice notes and videos do need the element, and WebKit only takes
+       an element's MPRIS player down when the element is destroyed or when
+       another media session starts playing (MediaSessionManagerGLib::
+       unregisterAllOtherSessions). WhatsApp keeps its elements alive, so the
+       player sat in GNOME as an empty "Stopped" card after every voice note.
+       When one ends, a muted 0.2 s silent clip is played: that unregisters the
+       voice note's player, and a muted clip is never "now playing", so it does
+       not register one of its own. Measured on WebKitGTK 2.54: volume 0 is not
+       enough, it has to be muted. The next voice note registers again. */
+    let silentUrl = null;
+    const silentClip = () => {
+      if (silentUrl) return silentUrl;
+      const n = 1600;   // 0.2 s of 8 kHz, 8-bit mono silence
+      const bytes = new ArrayBuffer(44 + n);
+      const v = new DataView(bytes);
+      const tag = (at, text) => { for (let i = 0; i < 4; i++) v.setUint8(at + i, text.charCodeAt(i)); };
+      tag(0, 'RIFF'); v.setUint32(4, 36 + n, true); tag(8, 'WAVE');
+      tag(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+      tag(36, 'data'); v.setUint32(40, n, true);
+      new Uint8Array(bytes, 44).fill(128);
+      silentUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+      return silentUrl;
+    };
+    const dropPlayer = () => {
+      const clip = new Audio(silentClip());
+      clip.muted = true;
+      realPlay.call(clip).catch(err => log('could not drop the media player: ' + err.message));
+    };
+    const watched = new WeakSet();
+
     HTMLMediaElement.prototype.play = function (...args) {
       const url = String(this.currentSrc || this.src);
       log('page sound: ' + url.slice(-28));
@@ -131,6 +163,10 @@
           log('tone through Web Audio failed (' + err.message + '), using the element');
           return realPlay.apply(this, args);
         });
+      if (!watched.has(this)) {
+        watched.add(this);
+        this.addEventListener('ended', dropPlayer);
+      }
       return realPlay.apply(this, args);
     };
   } catch (err) {
